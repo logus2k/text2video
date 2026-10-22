@@ -1,0 +1,35 @@
+# Wan2.2-TI2V-5B (GGUF) on Intel Arc GPU (XPU) — Python 3.14, WSL2 Ubuntu 26.04
+#
+# System prerequisites (Intel GPU Level Zero runtime, not pip-installable):
+#   sudo apt-get install -y --no-install-recommends libze1 libze-intel-gpu1 intel-opencl-icd
+#   (--no-install-recommends avoids the *-legacy driver, which segfaults torch.xpu on Arc 140V)
+#
+# Install:
+#   pip install -r requirements.txt
+
+# PyTorch with Intel XPU support
+--extra-index-url https://download.pytorch.org/whl/xpu
+torch==2.14.1+xpu
+torchvision==0.29.1+xpu
+
+# Diffusion pipeline + GGUF loading
+diffusers==0.41.0
+transformers==5.20.2
+accelerate==1.15.0
+gguf==0.19.0
+safetensors==0.8.0
+
+# Tokenizer (umT5)
+sentencepiece==0.2.2
+protobuf==7.36.2
+ftfy==6.3.1
+
+# Model download (Hugging Face, incl. Xet storage backend)
+huggingface_hub==2.2.0
+hf-xet==1.7.0
+
+# Video export
+imageio==2.38.1
+imageio-ffmpeg==0.6.0
+numpy==2.5.2
+pillow==12.3.0
