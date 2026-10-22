@@ -1,6 +1,8 @@
-"""Wan2.2-TI2V-5B text-to-video on an Intel Arc GPU (PyTorch XPU), using the local weights in models/wan2.2/.
+"""Wan2.2-TI2V-5B text-to-video on an NVIDIA (CUDA) or Intel Arc (XPU) GPU, using the local weights in models/wan2.2/.
 
     python generate.py --prompt "A red fox trotting through fresh snow at sunrise"
+
+The GPU backend is picked automatically (CUDA if available, otherwise XPU); force one with --device cuda|xpu.
 
 Weights (all local, see README.md):
     Wan2.2-TI2V-5B-Q8_0.gguf     transformer, GGUF Q8_0 (QuantStack / unsloth mirror)
@@ -8,9 +10,10 @@ Weights (all local, see README.md):
     umt5-xxl-encoder-Q8_0.gguf   umT5-XXL text encoder, GGUF Q8_0 (city96)
     diffusers-config/            configs + tokenizer from Wan-AI/Wan2.2-TI2V-5B-Diffusers
 
-Under WSL2 the iGPU's memory comes out of WSL's own RAM (~15 GB), so CPU and GPU share one budget. To fit, each model
-is loaded only for its stage and freed afterwards: text encoder -> transformer -> VAE. GGUF weights stay quantized on the
-GPU and are streamed from the memory-mapped file instead of being copied into RAM first.
+Each model is loaded only for its stage and freed afterwards: text encoder -> transformer -> VAE. This keeps the peak
+around 10.5 GiB, which is what lets it fit the Arc iGPU (whose memory under WSL2 comes out of WSL's own RAM, ~15 GB)
+and leaves room for other services sharing a discrete GPU. GGUF weights stay quantized on the GPU and are streamed from
+the memory-mapped file instead of being copied into RAM first.
 """
 
 import argparse
@@ -37,7 +40,7 @@ TRANSFORMER = MODELS / "Wan2.2-TI2V-5B-Q8_0.gguf"
 VAE = MODELS / "Wan2.2_VAE.safetensors"
 TEXT_ENCODER = MODELS / "umt5-xxl-encoder-Q8_0.gguf"
 
-DEVICE = "xpu"
+BACKENDS = ("cuda", "xpu")
 DTYPE = torch.bfloat16
 
 # Default negative prompt from the Wan2.2 model card.
@@ -70,6 +73,18 @@ VAE_RESIDUAL_KEYS = {
 }
 
 
+def pick_device(choice):
+    """Return the torch device to run on: the requested backend, or the first available one in BACKENDS order."""
+    available = [b for b in BACKENDS if getattr(torch, b, None) is not None and getattr(torch, b).is_available()]
+    if choice == "auto":
+        if not available:
+            raise SystemExit("No CUDA or XPU device found. Check the GPU runtime (see README.md).")
+        return torch.device(available[0])
+    if choice not in available:
+        raise SystemExit(f"Requested --device {choice} but it is not available (found: {available or 'none'}).")
+    return torch.device(choice)
+
+
 def umt5_key(name):
     if name == "token_embd.weight":
         return "shared.weight"
@@ -79,23 +94,23 @@ def umt5_key(name):
     return f"encoder.block.{block}.{UMT5_KEYS[layer]}.{param}"
 
 
-def gguf_tensors(path):
+def gguf_tensors(path, device):
     """Yield (name, tensor) from a GGUF file, moved straight from the memory-mapped file to the GPU."""
     for t in GGUFReader(path).tensors:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)  # memmap is read-only; it's copied by .to() anyway
-            data = torch.from_numpy(t.data).to(DEVICE)
+            data = torch.from_numpy(t.data).to(device)
         if t.tensor_type in (GGMLQuantizationType.F32, GGMLQuantizationType.F16):
             yield t.name, data.to(DTYPE)
         else:
             yield t.name, GGUFParameter(data, quant_type=t.tensor_type)
 
 
-def load_text_encoder():
+def load_text_encoder(device):
     """Build UMT5EncoderModel from the city96 GGUF. Linear layers stay Q8_0 and are dequantized on the fly."""
     with torch.device("meta"):
         model = UMT5EncoderModel(UMT5Config.from_pretrained(CONFIG / "text_encoder"))
-    state = {umt5_key(name): tensor for name, tensor in gguf_tensors(TEXT_ENCODER)}
+    state = {umt5_key(name): tensor for name, tensor in gguf_tensors(TEXT_ENCODER, device)}
     # Dequantized up front: nn.Embedding can't use GGUF weights, and UMT5 casts the input of each FFN "wo" layer to
     # wo.weight.dtype, which would be uint8 for a GGUF weight.
     for key in [k for k in state if k == "shared.weight" or k.endswith(".wo.weight")]:
@@ -143,18 +158,18 @@ def load_vae_config():
     return config
 
 
-def load_vae():
+def load_vae(device):
     # diffusers' single-file converter only knows the Wan2.1 VAE layout, so the Wan2.2 keys are mapped here.
     with torch.device("meta"):
         vae = AutoencoderKLWan.from_config(load_vae_config())
     n = vae.config.num_res_blocks
-    state = {vae_key(k, n): v.to(DEVICE, torch.float32) for k, v in load_file(VAE).items()}
+    state = {vae_key(k, n): v.to(device, torch.float32) for k, v in load_file(VAE).items()}
     vae.load_state_dict(state, assign=True)
     return vae.eval()
 
 
-def decode(latents):
-    vae = load_vae()
+def decode(latents, device):
+    vae = load_vae(device)
     mean = torch.tensor(vae.config.latents_mean).view(1, -1, 1, 1, 1).to(latents.device, torch.float32)
     std = torch.tensor(vae.config.latents_std).view(1, -1, 1, 1, 1).to(latents.device, torch.float32)
     with torch.no_grad():
@@ -172,15 +187,17 @@ def load_transformer():
     )
 
 
-def free_gpu():
+def free_gpu(device):
     gc.collect()
-    torch.xpu.empty_cache()
+    torch.get_device_module(device).empty_cache()
 
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--prompt", default="A red fox trotting through fresh snow in a pine forest at sunrise, cinematic, soft golden light")
     p.add_argument("--negative-prompt", default=NEGATIVE_PROMPT)
+    p.add_argument("--device", choices=("auto", *BACKENDS), default="auto",
+                   help="GPU backend; auto picks CUDA if available, otherwise XPU (default: auto)")
     # The model is trained at 1280x704 / 704x1280. Smaller sizes (multiples of 32) work and are much faster on an iGPU.
     p.add_argument("--width", type=int, default=640)
     p.add_argument("--height", type=int, default=352)
@@ -195,9 +212,9 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if not torch.xpu.is_available():
-        raise SystemExit("No Intel XPU device found. Check the Level Zero runtime (see README.md).")
-    print(f"Device: {torch.xpu.get_device_name(0)}")
+    device = pick_device(args.device)
+    backend = torch.get_device_module(device)
+    print(f"Device: {device.type} ({backend.get_device_name(0)})")
     out = args.out or ROOT / "outputs" / f"{datetime.now():%Y%m%d-%H%M%S}.mp4"
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -205,7 +222,7 @@ def main():
     print("[1/4] Encoding prompt")
     pipe = WanPipeline(
         tokenizer=AutoTokenizer.from_pretrained(CONFIG / "tokenizer"),
-        text_encoder=load_text_encoder(),
+        text_encoder=load_text_encoder(device),
         vae=None,  # loaded only for decoding, see decode()
         scheduler=UniPCMultistepScheduler.from_pretrained(CONFIG, subfolder="scheduler"),
         expand_timesteps=True,  # Wan2.2 TI2V
@@ -218,15 +235,15 @@ def main():
             prompt=args.prompt,
             negative_prompt=args.negative_prompt,
             do_classifier_free_guidance=args.guidance > 1.0,
-            device=DEVICE,
+            device=device,
             dtype=DTYPE,
         )
     pipe.register_modules(text_encoder=None)
-    free_gpu()
+    free_gpu(device)
 
     print(f"[2/4] Loading transformer ({time.time() - t0:.0f}s)")
-    pipe.register_modules(transformer=load_transformer().to(DEVICE))
-    free_gpu()
+    pipe.register_modules(transformer=load_transformer().to(device))
+    free_gpu(device)
 
     print(f"[3/4] Denoising {args.frames} frames at {args.width}x{args.height}, {args.steps} steps ({time.time() - t0:.0f}s)")
     latents = pipe(
@@ -241,13 +258,13 @@ def main():
         output_type="latent",
     ).frames
     pipe.register_modules(transformer=None)
-    free_gpu()
+    free_gpu(device)
 
     print(f"[4/4] Decoding ({time.time() - t0:.0f}s)")
-    video = decode(latents)
+    video = decode(latents, device)
 
     export_to_video(video, str(out), fps=args.fps)
-    print(f"Saved {out} ({time.time() - t0:.0f}s total, peak GPU memory {torch.xpu.max_memory_allocated() / 2**30:.1f} GiB)")
+    print(f"Saved {out} ({time.time() - t0:.0f}s total, peak GPU memory {backend.max_memory_allocated() / 2**30:.1f} GiB)")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,53 @@
+# One-shot CLI containers, one per GPU backend. Use ./run.sh (auto-detects the GPU) or pick a profile by hand:
+#   docker compose --profile cuda run --rm text2video-cuda --prompt "..."
+#   docker compose --profile xpu  run --rm text2video-xpu  --prompt "..."
+# Both services share the definition below; only the image build and the GPU passthrough differ.
+
+x-text2video: &text2video
+  build:
+    context: .
+  volumes:
+    - ./models:/app/models:ro
+    - ./outputs:/app/outputs
+  logging:
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  text2video-cuda:
+    <<: *text2video
+    profiles: [cuda]
+    image: text2video:cuda
+    build:
+      context: .
+      args:
+        BACKEND: cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  text2video-xpu:
+    <<: *text2video
+    profiles: [xpu]
+    image: text2video:xpu
+    build:
+      context: .
+      args:
+        BACKEND: xpu
+    # Intel GPU under WSL2: the compute runtime in the container talks to the Windows driver through /dev/dxg
+    # (libdxcore lives in /usr/lib/wsl); /dev/dri is what Level Zero enumerates.
+    devices:
+      - /dev/dri:/dev/dri
+      - /dev/dxg:/dev/dxg
+    volumes:
+      - ./models:/app/models:ro
+      - ./outputs:/app/outputs
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+    group_add:
+      - video
+      - render
