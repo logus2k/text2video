@@ -1,8 +1,8 @@
-# Wan2.2-TI2V-5B (GGUF) — packages shared by both GPU backends. Python 3.14.
-#
-# Do not install this file directly: pick the backend file, which pulls this one in plus the matching torch build.
-#   pip install -r requirements-cuda.txt   # NVIDIA (CUDA)
-#   pip install -r requirements-xpu.txt    # Intel Arc (XPU)
+# Wan2.2 (GGUF) on an NVIDIA GPU — Python 3.14, CUDA 13.0 torch build. The pip wheel bundles the CUDA runtime, so
+# the host only needs the NVIDIA driver (and, for Docker, the NVIDIA Container Toolkit).
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.14.1+cu130
+torchvision==0.29.1+cu130
 
 # Diffusion pipeline + GGUF loading
 diffusers==0.41.0
@@ -17,7 +17,7 @@ protobuf==7.36.2
 ftfy==6.3.1
 
 # Model download (Hugging Face, incl. Xet storage backend)
-huggingface_hub==2.2.0
+huggingface_hub==1.33.0  # diffusers 0.41.0 requires <2.0
 hf-xet==1.7.0
 
 # Video export

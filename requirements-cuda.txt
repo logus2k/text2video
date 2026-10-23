@@ -1,6 +1,0 @@
-# NVIDIA GPUs (RTX 4090 and similar). CUDA 13.0 build; the pip wheel bundles the CUDA runtime, so the host and the
-# container only need the NVIDIA driver (and, for Docker, the NVIDIA Container Toolkit).
---extra-index-url https://download.pytorch.org/whl/cu130
-torch==2.14.1+cu130
-torchvision==0.29.1+cu130
--r requirements.txt

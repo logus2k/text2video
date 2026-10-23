@@ -1,7 +1,0 @@
-# Intel Arc GPUs (XPU). Needs the Intel GPU Level Zero runtime on the host or in the container:
-#   apt-get install -y --no-install-recommends libze1 libze-intel-gpu1 intel-opencl-icd
-# (--no-install-recommends avoids the *-legacy driver, which segfaults torch.xpu on Arc 140V)
---extra-index-url https://download.pytorch.org/whl/xpu
-torch==2.14.1+xpu
-torchvision==0.29.1+xpu
--r requirements.txt
