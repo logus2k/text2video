@@ -14,6 +14,6 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY generate.py chain.py ./
+COPY generate.py chain.py prompt_extend.py ./
 # models/ and outputs/ are bind-mounted by docker-compose.yml.
 ENTRYPOINT ["python", "generate.py"]

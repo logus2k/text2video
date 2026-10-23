@@ -403,6 +403,9 @@ def parse_args():
     p.add_argument("--sampler", choices=("unipc", "euler"), help="unipc (default) or euler with 'simple' spacing (default with --lora)")
     p.add_argument("--prompt", default="A red fox trotting through fresh snow in a pine forest at sunrise, cinematic, soft golden light")
     p.add_argument("--negative-prompt", default=NEGATIVE_PROMPT)
+    p.add_argument("--extend-prompt", action="store_true",
+                   help="rewrite the prompt into Wan's detailed cinematic form with the local LLM first (see prompt_extend.py)")
+    p.add_argument("--extend-only", action="store_true", help="with --extend-prompt: print the extended prompt and exit")
     p.add_argument("--device", choices=("auto", *BACKENDS), default="auto",
                    help="GPU backend; auto picks CUDA if available, otherwise XPU (default: auto)")
     # Unset options take the model's defaults (see SPECS): native size, 5 s of video, official steps/guidance/shift.
@@ -452,6 +455,14 @@ def parse_args():
 
 def main():
     args, spec = parse_args()
+    if args.extend_prompt or args.extend_only:
+        # Done before any model is loaded, so the LLM server and the video model never need the GPU at the same time.
+        from prompt_extend import extend
+        extended = extend(args.prompt, args.image)
+        print(f"Prompt: {args.prompt}\nExtended: {extended}")
+        if args.extend_only:
+            return
+        args.prompt = extended
     device = pick_device(args.device)
     backend = torch.get_device_module(device)
     print(f"Device: {device.type} ({backend.get_device_name(0)}), model: {args.model} {args.quant}"
@@ -538,6 +549,7 @@ def main():
     video = decode(spec, latents, device, vae)
 
     export_to_video(video, str(out), fps=args.fps)
+    out.with_suffix(".txt").write_text(args.prompt + "\n")  # the prompt actually used (after extension)
     print(f"Saved {out} ({time.time() - t0:.0f}s total, peak GPU memory {backend.max_memory_allocated() / 2**30:.1f} GiB)")
 
 

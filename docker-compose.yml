@@ -10,6 +10,11 @@ services:
       # PyTorch's default allocator fragments (29 GiB reserved for 19 GiB allocated at 720p/81 frames on the 14B
       # model) and the WSL2 driver starts paging; expandable_segments crashes on WSL2. See README "Memory budget".
       - PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync
+      # Local OpenAI-compatible LLM (agent_server's llama-vision, Gemma 4) for --extend-prompt.
+      - LLM_URL=${LLM_URL:-http://host.docker.internal:8500}
+      - LLM_MODEL=${LLM_MODEL:-}
+    extra_hosts:
+      - host.docker.internal:host-gateway
     volumes:
       - ./models:/app/models:ro
       - ./outputs:/app/outputs

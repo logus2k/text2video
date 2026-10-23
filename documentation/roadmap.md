@@ -23,10 +23,11 @@ Goal: cut the 14B render from 40 steps to 4 (720p clip from 61 min to ~7 min, 48
   (b) 480p clip, then 720p clip, same prompt/seed as the 40-step renders; compare frames side by side.
 - Risk: quality loss on large motion (authors' caveat); V2.0 vs V1.1 to be compared on the same seed.
 
-## 2. Image-to-video (5B done 2026-10-23; 14B pending download)
+## 2. Image-to-video (done 2026-10-23)
 
 `--image` in generate.py. 5B verified: first frame matches the input (PSNR 38.6 dB), 7.8 min at 1280x704/121 frames.
-14B: experts + I2V LoRA downloading; same code path (spec "14b-i2v", boundary 0.9).
+14B verified with the I2V Q6_K experts and the I2V Lightning LoRA: 4.8 min at 1280x720/81 frames, 19.9 GiB peak,
+first frame PSNR 34.2 dB against the input.
 
 Original plan:
 
@@ -60,7 +61,12 @@ Goal: N prompts -> one continuous MP4.
   subject LoRA.
 - Verify: 3-segment chain, inspect the two seams frame by frame.
 
-## 4. Prompt extension
+## 4. Prompt extension (done 2026-10-23)
+
+`--extend-prompt` / `--extend-only` in generate.py, `prompt_extend.py` with the official Wan system prompts, calling
+agent_server's llama-vision (Gemma 4, multimodal) through LLM_URL. Text and image-aware rewrites verified live.
+
+Original plan:
 
 Goal: better adherence from short prompts, as the official pipeline does with Qwen.
 

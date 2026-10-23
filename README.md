@@ -29,6 +29,12 @@ Wan2.2-TI2V-5B (`--model 5b`), also in `models/wan2.2/`:
 | `Wan2.2_VAE.safetensors` | Wan2.2 VAE, fp16 (1.4 GB) | same repo, `VAE/` |
 | `diffusers-config/` | Model configs, scheduler (~21 MB) | [Wan-AI/Wan2.2-TI2V-5B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B-Diffusers) |
 
+Wan2.2-I2V-A14B (`--model 14b --image ...`), in `models/wan2.2-i2v-a14b/`, same layout: `HighNoise/` and `LowNoise/`
+`Wan2.2-I2V-A14B-*-Q6_K.gguf` (11.2 GB each) from
+[QuantStack/Wan2.2-I2V-A14B-GGUF](https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF), `VAE/Wan2.1_VAE.safetensors`
+from the same repo, and `diffusers-config/` from
+[Wan-AI/Wan2.2-I2V-A14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B-Diffusers).
+
 Wan2.2-T2V-A14B (`--model 14b`), in `models/wan2.2-t2v-a14b/`:
 
 | File | What | Source |
@@ -44,6 +50,7 @@ Lightning 4-step LoRAs (optional, `--lora`), in `models/loras/`:
 |---|---|---|
 | `Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0/` | high/low-noise LoRA pair, rank 64 (2 x 1.17 GB) | [lightx2v/Wan2.2-Lightning](https://huggingface.co/lightx2v/Wan2.2-Lightning) |
 | `Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V1.1/` | previous version, for comparison | same repo |
+| `Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/` | the image-to-video pair (default with `--image --lora`) | same repo |
 
 The GGUF repos ship no text encoder; city96's umT5-XXL encoder GGUF is the one used with these GGUF Wan models in
 ComfyUI-GGUF (Wan2.1 and 2.2 share the same umT5-XXL encoder). City96 recommends Q5_K_M or larger. Smaller A14B
@@ -122,6 +129,25 @@ Segments are kept as `<out>-01.mp4`, `<out>-02.mp4`, ... with their last frames 
 prompts; `--start N` re-renders from segment N reusing the earlier ones. Expect some drift in colour and detail across
 many hops; a reference still reused as `--image` for every segment, or a subject LoRA, limits it.
 
+### Prompt extension
+
+Wan was trained on long, detailed shot descriptions, and the official pipeline rewrites short prompts with an LLM
+before generation. `--extend-prompt` does the same with the local OpenAI-compatible server (agent_server's
+`llama-vision`, Gemma 4), using the official system prompts verbatim (`prompt_extend.py`): the text-to-video one, or the
+image-to-video one with the start image attached when `--image` is given. The prompt actually used is written next to
+the output as `<out>.txt`.
+
+```bash
+docker compose run --rm text2video --extend-prompt --prompt "A red fox trotting through snow at sunrise" ...
+docker compose run --rm text2video --extend-prompt --extend-only --prompt "..."    # just print the rewrite
+docker compose run --rm --entrypoint python text2video prompt_extend.py "..."      # same, standalone
+```
+
+The LLM is called before any video model is loaded. The server holds ~10 GB of VRAM while it runs, which does not
+leave room for a 720p render: extend first (`--extend-only`), stop the LLM, then render with the printed prompt, or keep
+it up only for 5B / 480p work. `LLM_URL` and `LLM_MODEL` come from the environment (compose defaults to the host's
+port 8500 and the first chat model the server lists).
+
 ### Lightning 4-step LoRA (14B)
 
 [lightx2v/Wan2.2-Lightning](https://huggingface.co/lightx2v/Wan2.2-Lightning) distills the 14B model to 4 steps without
@@ -130,7 +156,16 @@ classifier-free guidance, which cuts a render by ~10x. One LoRA per expert, 1.17
 ```bash
 hf download lightx2v/Wan2.2-Lightning Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0/high_noise_model.safetensors \
   Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0/low_noise_model.safetensors --local-dir models/loras
+hf download lightx2v/Wan2.2-Lightning Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/high_noise_model.safetensors \
+  Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1/low_noise_model.safetensors --local-dir models/loras
+# 14B image-to-video experts
+hf download QuantStack/Wan2.2-I2V-A14B-GGUF HighNoise/Wan2.2-I2V-A14B-HighNoise-Q6_K.gguf \
+  LowNoise/Wan2.2-I2V-A14B-LowNoise-Q6_K.gguf VAE/Wan2.1_VAE.safetensors --local-dir models/wan2.2-i2v-a14b
+hf download Wan-AI/Wan2.2-I2V-A14B-Diffusers model_index.json scheduler/scheduler_config.json \
+  transformer/config.json transformer_2/config.json vae/config.json --local-dir models/wan2.2-i2v-a14b/diffusers-config
 ```
+
+A bare `--lora` picks the model's default pair (T2V V2.0, or the I2V V1 pair with `--image`).
 
 `--lora <name>` applies them and switches the defaults to the authors' settings: 4 steps, guidance 1.0, shift 5, Euler
 sampler with "simple" spacing (timesteps 1000, 937, 833, 625; the expert swap lands after step 2). The LoRA is applied
@@ -188,7 +223,9 @@ Two memory fixes make 720p video possible on the 14B model, both in `generate.py
 | 14B Q6_K + Lightning LoRA, 832x480, 81 frames, 4 steps | RTX 4090 (container) | **90 s** | 14.9 GiB |
 | 14B Q6_K + Lightning LoRA, 1280x720, 81 frames, 4 steps | RTX 4090 (container) | **3.8 min** (~46 s/step), decode 13 s | 18.6 GiB |
 | 5B image-to-video, 1280x704, 121 frames, 50 steps | RTX 4090 (container) | 7.8 min | 11.9 GiB |
+| 14B Q6_K image-to-video + I2V Lightning LoRA, 1280x720, 81 frames, 4 steps | RTX 4090 (container) | 4.8 min | 19.9 GiB |
 | chain.py, 3 x 41 frames, 5B, 30 steps | RTX 4090 (container) | 4.5 min (90 s per segment) | 11.7 GiB |
+| prompt extension (Gemma 4 on llama-vision) | RTX 4090 | 1.4 s per prompt | ~10 GB held by the LLM server |
 
 Same seed, fp32 vs bf16 decode: PSNR 42 dB between the two videos, no visible difference.
 
