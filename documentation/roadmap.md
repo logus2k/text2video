@@ -40,7 +40,13 @@ Goal: animate a chosen still; prerequisite for clip chaining.
 - Code: `--image <file>` selects the I2V pipeline; the image is resized to the target size, aspect preserved.
 - Verify: animate `outputs/fox-still-14b.png`; first frame of the output must match the input.
 
-## 3. Longer videos by chaining (step A done 2026-10-23)
+## 3. Longer videos by chaining (step A done 2026-10-23; step B VACE done 2026-10-23)
+
+Step B: `--model vace --extend <clip> --overlap 9` and `chain.py --mode vace`. Wan2.1 VACE 14B Q6_K + Wan2.1 4-step
+LoRA at 480p: 112 s per continuation, 19.2 GiB peak. Verified: the extension reproduces the 9 context frames (PSNR
+31-33 dB) and the motion continues through the seam (same gait, lighting, background). Needed on the way: lazy VACE
+control hints (bit-identical, -2 GiB), VAE tiling + pool release for the conditioning encode, a text-encoder reference
+leak fixed in generate.py.
 
 chain.py verified with a 3-segment 5B chain (41 frames each): seams continuous (PSNR 32.8 dB between the seed frame
 and the next segment's first frame), scene and subject preserved. Observed limits, as expected from last-frame

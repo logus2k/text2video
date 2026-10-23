@@ -1,5 +1,10 @@
 # text2video — Wan2.2 on an RTX 4090
 
+> **Moved on 2026-10-23:** the code became the `movie_engine` service (`~/env/assets/movie_engine`: the same
+> `generate.py`/`chain.py`/`prompt_extend.py` under `src/movie_engine/render/`, plus a jobs API). The model files
+> live there too (`models/2026-10-23a/`; this folder's `models/` is a symlink to it). This README stays as the record
+> of the experiments and measurements.
+
 Text-to-video with [Wan2.2](https://github.com/Wan-Video/Wan2.2) from quantized GGUF weights stored in `models/`, run
 in a Docker container on the desktop's NVIDIA RTX 4090 (24 GB, WSL2). Two models are supported, selected with
 `--model`:
@@ -148,6 +153,29 @@ leave room for a 720p render: extend first (`--extend-only`), stop the LLM, then
 it up only for 5B / 480p work. `LLM_URL` and `LLM_MODEL` come from the environment (compose defaults to the host's
 port 8500 and the first chat model the server lists).
 
+### Continuing a clip with VACE (motion carries across the seam)
+
+Last-frame chaining restarts the motion at every seam. `--model vace` uses Wan2.1 VACE 14B to continue a clip from its
+last frames instead: the last `--overlap` frames (default 9) are kept as context (black mask) and the rest is generated
+(grey frames, white mask), the "firstclip" task of the VACE user guide. The 4-step Wan2.1 distillation LoRA applies.
+Files: `models/wan2.1-vace-14b/Wan2.1_14B_VACE-Q6_K.gguf` from
+[QuantStack/Wan2.1_14B_VACE-GGUF](https://huggingface.co/QuantStack/Wan2.1_14B_VACE-GGUF), its `diffusers-config/`
+from [Wan-AI/Wan2.1-VACE-14B-diffusers](https://huggingface.co/Wan-AI/Wan2.1-VACE-14B-diffusers), the Wan2.1 VAE
+(shared with the 14B T2V), and `models/loras/Wan2.1-T2V-14B-lightx2v/loras/…rank64.safetensors` from
+[lightx2v/Wan2.1-T2V-14B-StepDistill-CfgDistill-Lightx2v](https://huggingface.co/lightx2v/Wan2.1-T2V-14B-StepDistill-CfgDistill-Lightx2v).
+
+```bash
+docker compose run --rm text2video --model vace --quant Q6_K --lora --extend outputs/clip.mp4 --overlap 9 --prompt "..."
+docker compose run --rm --entrypoint python text2video chain.py --mode vace --overlap 9 --lora --quant Q6_K \
+  --width 832 --height 480 --prompt "..." --prompt "..." --prompt "..." --out outputs/story.mp4
+```
+
+At 81 frames this fits 480p only (the VACE control branch adds ~2 GiB of activations); 720p works with a shorter
+window, `--frames 33 --width 1280 --height 720` (9 context + 24 new frames per pass, the same token count as
+480p x 81: measured 19.2 GiB, 146 s per pass). The joined video drops the 9 repeated frames at each seam. Two memory fixes make it fit (`generate.py`): the eight VACE control hints are computed lazily,
+one at a time, instead of all up front (bit-identical, ~2 GiB less), and the conditioning encode runs with VAE tiling
+and gives its pool back before denoising.
+
 ### Lightning 4-step LoRA (14B)
 
 [lightx2v/Wan2.2-Lightning](https://huggingface.co/lightx2v/Wan2.2-Lightning) distills the 14B model to 4 steps without
@@ -224,6 +252,9 @@ Two memory fixes make 720p video possible on the 14B model, both in `generate.py
 | 14B Q6_K + Lightning LoRA, 1280x720, 81 frames, 4 steps | RTX 4090 (container) | **3.8 min** (~46 s/step), decode 13 s | 18.6 GiB |
 | 5B image-to-video, 1280x704, 121 frames, 50 steps | RTX 4090 (container) | 7.8 min | 11.9 GiB |
 | 14B Q6_K image-to-video + I2V Lightning LoRA, 1280x720, 81 frames, 4 steps | RTX 4090 (container) | 4.8 min | 19.9 GiB |
+| VACE 14B Q6_K + 4-step LoRA, 832x480, 81 frames (9 context + 72 new) | RTX 4090 (container) | 1.9 min (19 s/step) | 19.2 GiB |
+| chain.py --mode vace, 3 segments (14B 4-step + 2 VACE continuations), 480p | RTX 4090 (container) | 6 min for 14.1 s of video | 19.2 GiB |
+| VACE 14B Q6_K + 4-step LoRA, 1280x720, 33-frame window (9 context + 24 new) | RTX 4090 (container) | 2.4 min per pass (1.5 s of new video) | 19.2 GiB |
 | chain.py, 3 x 41 frames, 5B, 30 steps | RTX 4090 (container) | 4.5 min (90 s per segment) | 11.7 GiB |
 | prompt extension (Gemma 4 on llama-vision) | RTX 4090 | 1.4 s per prompt | ~10 GB held by the LLM server |
 

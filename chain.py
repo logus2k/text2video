@@ -35,6 +35,10 @@ def parse_args():
     p.add_argument("--fps", type=int, help="output fps (default: the segments' fps)")
     p.add_argument("--start", type=int, default=1, help="resume: first segment to (re)render; earlier ones are reused")
     p.add_argument("--image", type=Path, help="start the first segment from this image instead of from text")
+    p.add_argument("--mode", choices=("last-frame", "vace"), default="last-frame",
+                   help="how a segment continues the previous one: last-frame = image-to-video from its last frame; "
+                        "vace = Wan2.1 VACE extension from its last --overlap frames (motion carries across the seam)")
+    p.add_argument("--overlap", type=int, default=9, help="vace: context frames (4k+1)")
     return p.parse_known_args()
 
 
@@ -51,12 +55,13 @@ def last_frame(video, path):
     return frames.shape[1:3]
 
 
-def join(segments, out, crossfade, fps):
+def join(segments, out, crossfade, fps, overlap=1):
+    """Concatenate; each continuation's first `overlap` frames repeat the previous clip's tail and are dropped."""
     clips, fps_list = zip(*(read_video(seg) for seg in segments))
     fps = fps or round(fps_list[0])
     video = clips[0]
     for clip in clips[1:]:
-        clip = clip[1:]  # frame 0 is the seed frame = last frame of the previous clip
+        clip = clip[overlap:]
         if crossfade and len(video) > crossfade and len(clip) > crossfade:
             w = np.linspace(0, 1, crossfade + 2)[1:-1, None, None, None]
             blend = (video[-crossfade:] * (1 - w) + clip[:crossfade] * w).astype(np.uint8)
@@ -75,24 +80,28 @@ def main():
     stem = out.with_suffix("")
     segments = []
     seed_image = args.image
+    prev_seg = None
     for i, prompt in enumerate(args.prompt, 1):
         seg = Path(f"{stem}-{i:02d}.mp4")
         if i >= args.start:
             cmd = [sys.executable, str(ROOT / "generate.py"), "--prompt", prompt, "--out", str(seg), *passthrough]
-            if seed_image:
+            if args.mode == "vace" and prev_seg is not None:
+                cmd += ["--model", "vace", "--extend", str(prev_seg), "--overlap", str(args.overlap)]
+            elif seed_image:
                 cmd += ["--image", str(seed_image)]
             print(f"=== segment {i}/{len(args.prompt)}: {prompt}", flush=True)
             subprocess.run(cmd, check=True)
         elif not seg.is_file():
             raise SystemExit(f"--start {args.start} but {seg} does not exist")
         segments.append(seg)
+        prev_seg = seg
         seed_image = Path(f"{stem}-{i:02d}-last.png")
         size = last_frame(seg, seed_image)
         print(f"    last frame {size[1]}x{size[0]} -> {seed_image.name}", flush=True)
-    n, fps = join(segments, out, args.crossfade, args.fps)
+    n, fps = join(segments, out, args.crossfade, args.fps, overlap=args.overlap if args.mode == "vace" else 1)
     (stem.parent / f"{stem.name}.json").write_text(json.dumps(
         {"prompts": args.prompt, "segments": [s.name for s in segments], "generate_args": passthrough,
-         "crossfade": args.crossfade, "frames": n, "fps": fps}, indent=2))
+         "mode": args.mode, "overlap": args.overlap, "crossfade": args.crossfade, "frames": n, "fps": fps}, indent=2))
     print(f"Saved {out}: {n} frames at {fps} fps = {n / fps:.1f} s from {len(segments)} segments", flush=True)
 
 

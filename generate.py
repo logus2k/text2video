@@ -35,7 +35,8 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
 import torch
 import diffusers.models.transformers.transformer_wan as transformer_wan
 from diffusers import (AutoencoderKLWan, FlowMatchEulerDiscreteScheduler, GGUFQuantizationConfig, UniPCMultistepScheduler,
-                       WanImageToVideoPipeline, WanPipeline, WanTransformer3DModel)
+                       WanImageToVideoPipeline, WanPipeline, WanTransformer3DModel, WanVACEPipeline,
+                       WanVACETransformer3DModel)
 from PIL import Image
 from diffusers.quantizers.gguf.utils import GGUFParameter, _replace_with_gguf_linear, dequantize_gguf_tensor
 from diffusers.utils import export_to_video
@@ -74,6 +75,8 @@ class ModelSpec:
     expand_timesteps: bool = False    # per-token timesteps (Wan2.2 TI2V)
     wan22_vae: bool = False           # Wan2.2 VAE file (original key layout, mapped by load_vae_22)
     lora: str | None = None           # default Lightning LoRA folder name under models/loras/
+    lora_files: tuple = ("high_noise_model.safetensors", "low_noise_model.safetensors")  # per expert, inside the folder
+    vace: bool = False                # Wan VACE (video extension / editing): WanVACETransformer3DModel + WanVACEPipeline
 
     @property
     def config(self):
@@ -100,6 +103,16 @@ SPECS = {
         vae="VAE/Wan2.1_VAE.safetensors",
         width=1280, height=720, frames=81, steps=40, guidance=4.0, guidance_2=3.0, fps=16, shift=12.0, boundary=0.9,
         lora="Wan2.2-I2V-A14B-4steps-lora-rank64-Seko-V1",
+    ),
+    # Wan2.1 VACE 14B: continues a clip from its last frames (context frames + mask), 480p on this card.
+    # Scheduler config ships flow_shift 3.0 (Wan2.1 480p); Wan2.1 guidance default 5.0.
+    "vace": ModelSpec(
+        dir=MODELS / "wan2.1-vace-14b",
+        transformer="Wan2.1_14B_VACE-{quant}.gguf",
+        vae=str(MODELS / "wan2.2-t2v-a14b" / "VAE" / "Wan2.1_VAE.safetensors"),
+        width=832, height=480, frames=81, steps=40, guidance=5.0, fps=16, shift=3.0,
+        lora="Wan2.1-T2V-14B-lightx2v", lora_files=("loras/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors",),
+        vace=True,
     ),
     "5b": ModelSpec(
         dir=SHARED,
@@ -269,11 +282,12 @@ def make_scheduler(spec, sampler, shift):
 _LORA_SCRATCH = {}
 
 
-def _scratch(key, n, device):
-    """A reusable bf16 scratch buffer of at least n elements, so the LoRA path allocates nothing per forward."""
+def _scratch(key, n, device, dtype=DTYPE):
+    """A reusable scratch buffer of at least n elements, so the LoRA path allocates nothing per forward."""
+    key = (key, dtype)
     buf = _LORA_SCRATCH.get(key)
     if buf is None or buf.numel() < n or buf.device != device:
-        buf = _LORA_SCRATCH[key] = torch.empty(n, dtype=DTYPE, device=device)
+        buf = _LORA_SCRATCH[key] = torch.empty(n, dtype=dtype, device=device)
     return buf
 
 
@@ -282,40 +296,46 @@ def apply_lora(transformer, path, strength=1.0):
 
     Done by hand rather than with PEFT: PEFT's adapter adds ~1.3 GiB of full-size temporaries at 720p, and on WSL2 the
     expandable-segments allocator fails with "CUDA driver error: unknown error" when the LoRA path allocates many
-    temporaries per forward. Here each linear layer's forward gets `out += (x @ A^T) @ B^T * strength`, computed in
-    sequence chunks through two preallocated scratch buffers, so a forward pass allocates nothing extra and the only
-    extra resident memory is the LoRA weights (registered as buffers, so they follow the module to "meta" when the
-    expert is released). diffusers' converter folds alpha/rank into A and B, so no further scaling is needed.
+    temporaries per forward. Here each linear layer's forward gets `out += (x @ A^T) @ B^T * strength` (+ the LoRA's
+    bias delta when it has one), computed in row chunks through two preallocated scratch buffers, so a forward pass
+    allocates nothing extra and the only extra resident memory is the LoRA weights (registered as buffers, so they
+    follow the module to "meta" when the expert is released). diffusers' converter folds alpha/rank into A and B.
+    Inputs of any shape (B, ..., in) are handled: the rows are flattened.
     """
-    state = WanPipeline.lora_state_dict(str(path))  # -> transformer.<module>.lora_A.weight / lora_B.weight
-    pairs = {}
+    state = WanPipeline.lora_state_dict(str(path))  # -> transformer.<module>.lora_A.weight / lora_B.weight / lora_B.bias
+    layers = {}
     for key, tensor in state.items():
-        module, kind = key.removeprefix("transformer.").rsplit(".lora_", 1)  # kind: "A.weight" / "B.weight"
-        pairs.setdefault(module, {})[kind[0]] = tensor
+        module, kind = key.removeprefix("transformer.").rsplit(".lora_", 1)  # kind: A.weight / B.weight / B.bias
+        layers.setdefault(module, {})[kind] = tensor
     device = next(transformer.parameters()).device
-    for module_name, ab in pairs.items():
+    for module_name, parts in layers.items():
         linear = transformer.get_submodule(module_name)
-        linear.register_buffer("lora_A", ab["A"].to(device, DTYPE), persistent=False)  # (rank, in)
-        linear.register_buffer("lora_B", ab["B"].to(device, DTYPE), persistent=False)  # (out, rank)
+        linear.register_buffer("lora_A", parts["A.weight"].to(device, DTYPE), persistent=False)  # (rank, in)
+        linear.register_buffer("lora_B", parts["B.weight"].to(device, DTYPE), persistent=False)  # (out, rank)
+        bias = parts.get("B.bias")
+        linear.register_buffer("lora_bias", bias.to(device, DTYPE) if bias is not None else None, persistent=False)
         base_forward = linear.forward
 
         def forward(x, _lin=linear, _base=base_forward, _s=strength):
             out = _base(x)
-            A, B = _lin.lora_A, _lin.lora_B
-            if x.shape[0] != 1:  # batch > 1 never happens here (CFG runs cond/uncond separately); keep it simple
-                return out.add_((x @ A.T) @ B.T, alpha=_s)
-            rank, out_features = B.shape[1], B.shape[0]
-            for s in range(0, x.shape[1], LEAN_CHUNK):
-                n = min(LEAN_CHUNK, x.shape[1] - s)
-                t1 = _scratch("t1", LEAN_CHUNK * rank, x.device)[: n * rank].view(1, n, rank)
-                t2 = _scratch("t2", LEAN_CHUNK * out_features, x.device)[: n * out_features].view(1, n, out_features)
-                torch.matmul(x[:, s:s + n], A.T, out=t1)
+            dt = out.dtype  # bf16 for the blocks; fp32 for the time embedder
+            A, B = _lin.lora_A.to(dt), _lin.lora_B.to(dt)
+            out_features, rank = B.shape
+            rows_in = x.reshape(-1, x.shape[-1]).to(dt)
+            rows_out = out.view(-1, out_features)
+            for s in range(0, rows_in.shape[0], LEAN_CHUNK):
+                n = min(LEAN_CHUNK, rows_in.shape[0] - s)
+                t1 = _scratch("t1", LEAN_CHUNK * rank, x.device, dt)[: n * rank].view(n, rank)
+                t2 = _scratch("t2", LEAN_CHUNK * out_features, x.device, dt)[: n * out_features].view(n, out_features)
+                torch.matmul(rows_in[s:s + n], A.T, out=t1)
                 torch.matmul(t1, B.T, out=t2)
-                out[:, s:s + n].add_(t2, alpha=_s)
+                rows_out[s:s + n].add_(t2, alpha=_s)
+            if _lin.lora_bias is not None:
+                out.add_(_lin.lora_bias.to(dt), alpha=_s)
             return out
 
         linear.forward = forward
-    return len(pairs)
+    return len(layers)
 
 
 # --- Memory-lean transformer block -----------------------------------------------------------------------------------
@@ -372,11 +392,89 @@ def lean_block_forward(self, hidden_states, encoder_hidden_states, temb, rotary_
 
 
 transformer_wan.WanTransformerBlock.forward = lean_block_forward
+
+
+def lean_vace_block_forward(self, hidden_states, encoder_hidden_states, control_hidden_states, temb, rotary_emb):
+    """Drop-in for WanVACETransformerBlock.forward (diffusers 0.41.0): same math, chunked fp32 (see lean_block_forward)."""
+    if self.proj_in is not None:
+        control_hidden_states = self.proj_in(control_hidden_states) + hidden_states
+    mods = list((self.scale_shift_table.to(temb.device) + temb.float()).chunk(6, dim=1))
+    shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = mods
+    attn_output = self.attn1(_norm_modulate(control_hidden_states, self.norm1, scale_msa, shift_msa), None, None, rotary_emb)
+    control_hidden_states = _residual(control_hidden_states, attn_output, gate_msa)
+    del attn_output
+    attn_output = self.attn2(_norm_modulate(control_hidden_states, self.norm2), encoder_hidden_states, None, None)
+    control_hidden_states = control_hidden_states + attn_output
+    del attn_output
+    ff_output = self.ffn(_norm_modulate(control_hidden_states, self.norm3, c_scale_msa, c_shift_msa))
+    control_hidden_states = _residual(control_hidden_states, ff_output, c_gate_msa)
+    conditioning_states = self.proj_out(control_hidden_states) if self.proj_out is not None else None
+    return conditioning_states, control_hidden_states
+
+
+def lazy_vace_forward(self, hidden_states, timestep, encoder_hidden_states, encoder_hidden_states_image=None,
+                      control_hidden_states=None, control_hidden_states_scale=None, return_dict=True,
+                      attention_kwargs=None):
+    """Drop-in for WanVACETransformer3DModel.forward (diffusers 0.41.0, inference path), same math in a different order.
+
+    The original computes all 8 VACE control hints before the main blocks and keeps them resident: 8 x (tokens x 5120)
+    bf16, 2.7 GiB at 832x480 x 81 frames, which pushed the 4090 into paging. The hints depend only on the input hidden
+    states and on the control chain, so each is computed right before the layer that consumes it: one hint alive at a
+    time. Measured: identical output, ~2 GiB less at 480p.
+    """
+    from diffusers.models.modeling_outputs import Transformer2DModelOutput
+    batch_size, num_channels, num_frames, height, width = hidden_states.shape
+    p_t, p_h, p_w = self.config.patch_size
+    post_patch_num_frames, post_patch_height, post_patch_width = num_frames // p_t, height // p_h, width // p_w
+    if control_hidden_states_scale is None:
+        control_hidden_states_scale = control_hidden_states.new_ones(len(self.config.vace_layers))
+    control_hidden_states_scale = torch.unbind(control_hidden_states_scale)
+    if len(control_hidden_states_scale) != len(self.config.vace_layers):
+        raise ValueError(f"control_hidden_states_scale has {len(control_hidden_states_scale)} entries, "
+                         f"expected {len(self.config.vace_layers)}")
+    rotary_emb = self.rope(hidden_states)
+    hidden_states = self.patch_embedding(hidden_states).flatten(2).transpose(1, 2)
+    control_hidden_states = self.vace_patch_embedding(control_hidden_states).flatten(2).transpose(1, 2)
+    padding = control_hidden_states.new_zeros(batch_size, hidden_states.size(1) - control_hidden_states.size(1),
+                                              control_hidden_states.size(2))
+    control_hidden_states = torch.cat([control_hidden_states, padding], dim=1)
+    temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
+        timestep, encoder_hidden_states, encoder_hidden_states_image)
+    timestep_proj = timestep_proj.unflatten(1, (6, -1))
+    if encoder_hidden_states_image is not None:
+        encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
+
+    hidden0 = hidden_states  # the VACE blocks see the input hidden states (blocks return new tensors, so no copy)
+    vace_layers = list(self.config.vace_layers)
+    next_hint = 0
+    for i, block in enumerate(self.blocks):
+        hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+        if i in vace_layers:
+            hint, control_hidden_states = self.vace_blocks[next_hint](
+                hidden0, encoder_hidden_states, control_hidden_states, timestep_proj, rotary_emb)
+            hidden_states = hidden_states + hint * control_hidden_states_scale[next_hint]
+            del hint
+            next_hint += 1
+    del hidden0
+
+    shift, scale = (self.scale_shift_table.to(temb.device) + temb.unsqueeze(1)).chunk(2, dim=1)
+    hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
+    hidden_states = self.proj_out(hidden_states)
+    hidden_states = hidden_states.reshape(batch_size, post_patch_num_frames, post_patch_height, post_patch_width,
+                                          p_t, p_h, p_w, -1)
+    output = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6).flatten(6, 7).flatten(4, 5).flatten(2, 3)
+    return (output,) if not return_dict else Transformer2DModelOutput(sample=output)
+
+
+import diffusers.models.transformers.transformer_wan_vace as transformer_wan_vace
+transformer_wan_vace.WanVACETransformerBlock.forward = lean_vace_block_forward
+transformer_wan_vace.WanVACETransformer3DModel.forward = lazy_vace_forward
 # ---------------------------------------------------------------------------------------------------------------------
 
 
 def load_transformer(spec, filename, quant):
-    return WanTransformer3DModel.from_single_file(
+    cls = WanVACETransformer3DModel if spec.vace else WanTransformer3DModel
+    return cls.from_single_file(
         str(spec.dir / filename.format(quant=quant)),
         config=str(spec.config),
         subfolder="transformer",
@@ -385,14 +483,35 @@ def load_transformer(spec, filename, quant):
     )
 
 
+def read_last_frames(path, n, size):
+    """The last n frames of an mp4 as PIL images, resized to size (w, h)."""
+    import imageio.v2 as imageio
+    with imageio.get_reader(str(path), "ffmpeg") as reader:
+        frames = [frame for frame in reader]
+    return [Image.fromarray(f).convert("RGB").resize(size, Image.LANCZOS) for f in frames[-n:]]
+
+
 def free_gpu(device):
     gc.collect()
     torch.get_device_module(device).empty_cache()
 
 
+def memlog(label, device):
+    """With T2V_MEMLOG=1, print allocator and driver-level GPU memory at a stage (diagnostics)."""
+    if os.environ.get("T2V_MEMLOG") and device.type == "cuda":
+        torch.cuda.synchronize()
+        free, total = torch.cuda.mem_get_info()
+        print(f"      [mem] {label:32} alloc {torch.cuda.memory_allocated()/2**30:5.2f} "
+              f"peak {torch.cuda.max_memory_allocated()/2**30:5.2f} reserved {torch.cuda.memory_reserved()/2**30:5.2f} "
+              f"driver {(total-free)/2**30:5.2f} GiB", flush=True)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("--model", choices=("14b", "5b"), default="14b", help="which Wan2.2 model to run (default: 14b)")
+    p.add_argument("--model", choices=("14b", "5b", "vace"), default="14b",
+                   help="14b (Wan2.2 T2V-A14B, default), 5b (Wan2.2 TI2V-5B) or vace (Wan2.1 VACE 14B, for --extend)")
+    p.add_argument("--extend", type=Path, help="vace: continue this clip; its last --overlap frames are the context")
+    p.add_argument("--overlap", type=int, default=9, help="vace: context frames taken from the end of --extend (4k+1, default 9)")
     p.add_argument("--image", type=Path, help="image-to-video: animate this image (14b: uses the I2V experts; 5b: same weights). "
                                              "Output size follows the image's aspect ratio at the model's native area unless --width/--height are given")
     p.add_argument("--quant", default="Q8_0", help="GGUF quantization of the transformer file(s) in models/, e.g. Q8_0, Q6_K")
@@ -423,13 +542,19 @@ def parse_args():
     if args.image and not args.image.is_file():
         p.error(f"--image {args.image}: no such file")
     spec = SPECS["14b-i2v" if args.image and args.model == "14b" else args.model]
+    if args.extend and not spec.vace:
+        p.error("--extend needs --model vace")
+    if spec.vace and not args.extend:
+        p.error("--model vace needs --extend <clip.mp4>")
+    if args.extend and not args.extend.is_file():
+        p.error(f"--extend {args.extend}: no such file")
     if args.lora:
-        if spec.transformer_2 is None:
-            p.error("--lora is only supported with --model 14b")
+        if spec.lora is None:
+            p.error(f"--lora is not supported with --model {args.model}")
         if args.lora == "default":
             args.lora = spec.lora
         args.lora = Path(args.lora) if Path(args.lora).is_absolute() else LORAS / args.lora
-        for f in ("high_noise_model.safetensors", "low_noise_model.safetensors"):
+        for f in spec.lora_files:
             if not (args.lora / f).is_file():
                 p.error(f"missing {args.lora / f}")
         # Lightning settings (from the authors' ComfyUI workflow): 4 steps, CFG 1.0, shift 5, euler/simple.
@@ -475,16 +600,31 @@ def main():
     print("[1/4] Encoding prompt")
     # Image-to-video needs the VAE up front (to encode the first frame), so it stays loaded; text-to-video loads it
     # only for decoding (see decode()).
-    vae = load_vae(spec, device) if args.image else None
-    pipe = (WanImageToVideoPipeline if args.image else WanPipeline)(
+    vae = load_vae(spec, device) if (args.image or args.extend) else None
+    pipeline_cls = WanVACEPipeline if spec.vace else WanImageToVideoPipeline if args.image else WanPipeline
+    extra = {} if spec.vace else {"expand_timesteps": spec.expand_timesteps}
+    pipe = pipeline_cls(
         tokenizer=AutoTokenizer.from_pretrained(TOKENIZER),
-        text_encoder=load_text_encoder(device),
+        text_encoder=load_text_encoder(device),  # passed directly: no other reference, so register_modules(None) frees it
         vae=vae,
         scheduler=make_scheduler(spec, args.sampler, args.shift),
         boundary_ratio=spec.boundary,
-        expand_timesteps=spec.expand_timesteps,
+        **extra,
     )
-    # The A14B vae/config.json omits the scale factors (class defaults 8 / 4), so read them off an instantiated config.
+    if spec.vace:
+        # The conditioning encode (VAE over 81 frames) is a multi-GiB transient; tiling bounds it, and the allocator's
+        # pool is given back before the transformer runs, or the two together push the card into paging.
+        vae.enable_tiling()
+        _prepare = pipe.prepare_video_latents
+
+        def prepare_and_free(*a, **k):
+            memlog("before conditioning encode", device)
+            out = _prepare(*a, **k)
+            free_gpu(device)
+            memlog("after conditioning encode + free", device)
+            return out
+
+        pipe.prepare_video_latents = prepare_and_free
     with torch.device("meta"):
         vae_config = AutoencoderKLWan.from_config(load_vae_config(spec)).config
     pipe.vae_scale_factor_spatial = vae_config.scale_factor_spatial
@@ -500,19 +640,24 @@ def main():
     pipe.register_modules(text_encoder=None)
     free_gpu(device)
 
-    def load_expert(filename, lora_file):
+    def load_expert(filename, index):
         model = load_transformer(spec, filename, args.quant).to(device)
         if args.lora:
+            lora_file = spec.lora_files[index]
             n = apply_lora(model, args.lora / lora_file)
             print(f"      LoRA {args.lora.name}/{lora_file}: {n} layers")
         return model
 
     print(f"[2/4] Loading transformer ({time.time() - t0:.0f}s)")
-    pipe.register_modules(transformer=load_expert(spec.transformer, "high_noise_model.safetensors"))
+    pipe.register_modules(transformer=load_expert(spec.transformer, 0))
     free_gpu(device)
+    memlog("transformer loaded", device)
 
     def swap_expert(pipe, i, t, callback_kwargs):
         """14b: once the next timestep is below the boundary, replace the high-noise expert with the low-noise one."""
+        memlog(f"after step {i + 1}", device)
+        if spec.boundary is None:
+            return {}
         timesteps = pipe.scheduler.timesteps
         boundary = spec.boundary * pipe.scheduler.config.num_train_timesteps
         if pipe.transformer_2 is None and i + 1 < len(timesteps) and timesteps[i + 1] < boundary:
@@ -522,12 +667,25 @@ def main():
             pipe.transformer.to("meta")
             pipe.register_modules(transformer=None)
             free_gpu(device)
-            pipe.register_modules(transformer_2=load_expert(spec.transformer_2, "low_noise_model.safetensors"))
+            pipe.register_modules(transformer_2=load_expert(spec.transformer_2, 1))
             free_gpu(device)
         return {}
 
     print(f"[3/4] Denoising {args.frames} frames at {args.width}x{args.height}, {args.steps} steps ({time.time() - t0:.0f}s)")
-    image_kwargs = {"image": Image.open(args.image).convert("RGB")} if args.image else {}
+    if args.extend:
+        # VACE video extension: the last --overlap frames of the clip are kept (black mask), the rest is generated
+        # (grey 127 frames, white mask), as in the VACE user guide's "firstclip" task.
+        context = read_last_frames(args.extend, args.overlap, (args.width, args.height))
+        grey = Image.new("RGB", (args.width, args.height), (127, 127, 127))
+        black = Image.new("RGB", (args.width, args.height), (0, 0, 0))
+        white = Image.new("RGB", (args.width, args.height), (255, 255, 255))
+        n_new = args.frames - len(context)
+        image_kwargs = {"video": context + [grey] * n_new, "mask": [black] * len(context) + [white] * n_new}
+        print(f"      extending {args.extend.name}: {len(context)} context frames + {n_new} new")
+    elif args.image:
+        image_kwargs = {"image": Image.open(args.image).convert("RGB")}
+    else:
+        image_kwargs = {}
     latents = pipe(
         **image_kwargs,
         prompt_embeds=prompt_embeds,
@@ -537,10 +695,10 @@ def main():
         num_frames=args.frames,
         num_inference_steps=args.steps,
         guidance_scale=args.guidance,
-        guidance_scale_2=args.guidance_2,
+        guidance_scale_2=args.guidance_2 if spec.boundary is not None else None,  # only valid with two experts
         generator=torch.Generator("cpu").manual_seed(args.seed),
         output_type="latent",
-        callback_on_step_end=swap_expert if spec.transformer_2 else None,
+        callback_on_step_end=swap_expert,
     ).frames
     pipe.register_modules(transformer=None, transformer_2=None)
     free_gpu(device)
