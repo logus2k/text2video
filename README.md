@@ -2,7 +2,7 @@
 
 > **Moved on 2026-10-23:** the code became the `movie_engine` service (`~/env/assets/movie_engine`: the same
 > `generate.py`/`chain.py`/`prompt_extend.py` under `src/movie_engine/render/`, plus a jobs API). The model files
-> live there too (`models/2026-10-23a/`; this folder's `models/` is a symlink to it). This README stays as the record
+> live at `/srv/ci-assets/movie_engine/<snapshot>/` (the CI asset root); this folder has no models any more. This README stays as the record
 > of the experiments and measurements.
 
 Text-to-video with [Wan2.2](https://github.com/Wan-Video/Wan2.2) from quantized GGUF weights stored in `models/`, run
